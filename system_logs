@@ -1,0 +1,617 @@
+#!/usr/bin/env python3
+"""
+Tenable Security Center — system/log Python Client
+====================================================
+Fetches login/auth events from the SC REST API with support for:
+  - Date range filtering (--date-from / --date-to)
+  - Limit on total logs retrieved (--limit)
+  - Severity filter override (--severity)
+  - Module filter override (--module)
+  - Keyword search (--keyword)
+  - Automatic pagination through large result sets
+  - Output to terminal table, JSON, or CSV file (--output)
+
+Requirements:
+    pip install requests urllib3
+
+Usage examples:
+    # All auth events, last 100 entries
+    python sc_login_logs.py --host 192.168.1.100 --access-key ABC --secret-key XYZ
+
+    # Failed logins only, specific month
+    python sc_login_logs.py --host sc.internal --access-key ABC --secret-key XYZ \\
+        --date-from 202505 --date-to 202505 --severity WARNING --limit 500
+
+    # Search for a specific user, export to CSV
+    python sc_login_logs.py --host sc.internal --access-key ABC --secret-key XYZ \\
+        --keyword jdoe --output logs.csv
+
+    # Override module to 'admin', get 1000 events with pagination
+    python sc_login_logs.py --host sc.internal --access-key ABC --secret-key XYZ \\
+        --module admin --limit 1000 --page-size 200
+
+    # Use environment variables instead of CLI flags
+    export SC_HOST=sc.internal SC_ACCESS_KEY=abc SC_SECRET_KEY=xyz
+    python sc_login_logs.py --limit 50 --output events.json
+"""
+
+import argparse
+import csv
+import io
+import json
+import os
+import sys
+import urllib3
+from datetime import datetime
+from typing import Optional
+
+try:
+    import requests
+except ImportError:
+    sys.exit("Missing dependency: pip install requests urllib3")
+
+# Suppress SSL warnings for self-signed certs (common in SC on-prem installs)
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+# ── ANSI colours ──────────────────────────────────────────────────────────────
+RESET  = "\x1b[0m"
+BOLD   = "\x1b[1m"
+DIM    = "\x1b[2m"
+CYAN   = "\x1b[36m"
+GREEN  = "\x1b[32m"
+YELLOW = "\x1b[33m"
+RED    = "\x1b[31m"
+BLUE   = "\x1b[34m"
+GRAY   = "\x1b[90m"
+WHITE  = "\x1b[37m"
+
+def clr(text: str, colour: str) -> str:
+    """Wrap text in colour codes (auto-disabled when not a TTY)."""
+    if not sys.stdout.isatty():
+        return str(text)
+    return f"{colour}{text}{RESET}"
+
+def banner(msg: str) -> None:
+    line = "─" * 64
+    print(f"\n{clr(line, CYAN)}\n  {clr(msg, BOLD + CYAN)}\n{clr(line, CYAN)}")
+
+def ok(msg: str)   -> None: print(clr(f"✓  {msg}", GREEN))
+def warn(msg: str) -> None: print(clr(f"⚠  {msg}", YELLOW))
+def err(msg: str)  -> None: print(clr(f"✗  {msg}", RED))
+def info(msg: str) -> None: print(clr(f"   {msg}", WHITE))
+def dim(msg: str)  -> None: print(clr(f"   {msg}", DIM + GRAY))
+
+
+# ── Severity colour map ───────────────────────────────────────────────────────
+SEV_COLOUR = {
+    "INFO":     GREEN,
+    "WARNING":  YELLOW,
+    "CRITICAL": RED,
+}
+
+def fmt_severity(sev: str) -> str:
+    return clr(sev.ljust(10), SEV_COLOUR.get(sev.upper(), WHITE))
+
+
+# ── CSV log parser ────────────────────────────────────────────────────────────
+# SC returns system/log as raw CSV lines:
+#   "timestamp","user","module","severity","type","message"
+FIELDS = ["timestamp", "user", "module", "severity", "type", "message"]
+
+def parse_csv_response(raw: str) -> list[dict]:
+    """Parse SC's CSV log response into a list of dicts."""
+    reader = csv.reader(io.StringIO(raw.strip()))
+    entries = []
+    for row in reader:
+        if not row:
+            continue
+        # Pad short rows with empty strings so zip always produces all keys
+        padded = row + [""] * max(0, len(FIELDS) - len(row))
+        entries.append(dict(zip(FIELDS, padded)))
+    return entries
+
+
+# ── SC API client ─────────────────────────────────────────────────────────────
+class SecurityCenterClient:
+    """Minimal Tenable Security Center REST API client."""
+
+    def __init__(self, host: str, access_key: str, secret_key: str, verify_ssl: bool = False):
+        self.base_url = f"https://{host}/rest"
+        self.session  = requests.Session()
+        self.session.verify = verify_ssl
+        self.session.headers.update({
+            "x-apikey":    f"accesskey={access_key}; secretkey={secret_key}",
+            "Accept":      "application/json",
+            "Content-Type": "application/json",
+        })
+
+    def get(self, path: str) -> dict:
+        url = f"{self.base_url}{path}"
+        dim(f"→ GET {url}")
+        resp = self.session.get(url, timeout=30)
+        dim(f"← HTTP {resp.status_code}  ({len(resp.content)} bytes)")
+        resp.raise_for_status()
+        return resp.json()
+
+    def post_log(self, payload: dict) -> requests.Response:
+        """POST to /system/log — returns raw Response (CSV body)."""
+        url = f"{self.base_url}/system/log"
+        dim(f"→ POST {url}  offset={payload['query']['startOffset']}–{payload['query']['endOffset']}")
+        resp = self.session.post(url, json=payload, timeout=60)
+        dim(f"← HTTP {resp.status_code}  ({len(resp.content)} bytes)")
+        resp.raise_for_status()
+        return resp
+
+    def ping(self) -> dict:
+        return self.get("/system")
+
+    def list_modules(self) -> list:
+        data = self.get("/system/log/module")
+        return data.get("response", [])
+
+
+# ── Paginator ─────────────────────────────────────────────────────────────────
+def fetch_all_pages(
+    client: SecurityCenterClient,
+    date_value: str,
+    filters: list[dict],
+    limit: int,
+    page_size: int,
+) -> list[dict]:
+    """
+    Paginate through /system/log until we have `limit` entries or the
+    server returns fewer rows than page_size (indicating last page).
+
+    Args:
+        client:     Authenticated SC client
+        date_value: 'all' or 'YYYYMM'
+        filters:    List of SC filter dicts
+        limit:      Maximum total entries to retrieve (0 = unlimited)
+        page_size:  Rows per page (endOffset - startOffset)
+
+    Returns:
+        Flat list of parsed log entry dicts
+    """
+    all_entries: list[dict] = []
+    offset = 0
+    page   = 1
+
+    while True:
+        # If a limit is set, don't request more than what's left
+        remaining  = (limit - len(all_entries)) if limit > 0 else page_size
+        batch_size = min(page_size, remaining) if limit > 0 else page_size
+
+        payload = {
+            "date": date_value,
+            "query": {
+                "startOffset": offset,
+                "endOffset":   offset + batch_size,
+                "filters":     filters,
+            },
+        }
+
+        banner(f"Page {page}  —  rows {offset + 1}–{offset + batch_size}")
+        info(f"Payload: {json.dumps(payload, indent=2)}")
+
+        try:
+            resp = client.post_log(payload)
+        except requests.HTTPError as e:
+            err(f"HTTP error on page {page}: {e}")
+            err(f"Response body: {e.response.text[:400]}")
+            break
+
+        # SC returns CSV; detect if somehow JSON was returned (error payloads)
+        content_type = resp.headers.get("content-type", "")
+        if "application/json" in content_type:
+            body = resp.json()
+            err(f"Unexpected JSON response: {json.dumps(body, indent=2)[:400]}")
+            break
+
+        entries = parse_csv_response(resp.text)
+        ok(f"Page {page}: received {len(entries)} entries")
+
+        all_entries.extend(entries)
+
+        # Stop conditions
+        if len(entries) < batch_size:
+            ok("Last page reached (server returned fewer rows than requested)")
+            break
+        if limit > 0 and len(all_entries) >= limit:
+            ok(f"Limit of {limit} entries reached")
+            all_entries = all_entries[:limit]
+            break
+
+        offset += batch_size
+        page   += 1
+
+    return all_entries
+
+
+# ── Output formatters ─────────────────────────────────────────────────────────
+def print_table(entries: list[dict], max_rows: int = 0) -> None:
+    """Render entries as a terminal table."""
+    if not entries:
+        warn("No log entries to display")
+        return
+
+    rows = entries[:max_rows] if max_rows > 0 else entries
+    ts_w, usr_w, sev_w = 36, 16, 12
+    hr = clr("─" * (ts_w + usr_w + sev_w + 54), GRAY)
+
+    print(hr)
+    print(
+        clr("TIMESTAMP".ljust(ts_w), BOLD + CYAN) +
+        clr("USER".ljust(usr_w),     BOLD + CYAN) +
+        clr("SEVERITY".ljust(sev_w), BOLD + CYAN) +
+        clr("MESSAGE",               BOLD + CYAN)
+    )
+    print(hr)
+
+    for e in rows:
+        msg = e.get("message", "")
+        if len(msg) > 82:
+            msg = msg[:79] + "..."
+        print(
+            clr(e.get("timestamp", "").ljust(ts_w), GRAY) +
+            clr((e.get("user") or "–").ljust(usr_w), BLUE) +
+            fmt_severity(e.get("severity", "")) +
+            clr(msg, WHITE)
+        )
+
+    print(hr)
+    if max_rows > 0 and len(entries) > max_rows:
+        warn(f"Showing {max_rows} of {len(entries)} entries (use --display-limit 0 to show all)")
+
+
+def print_stats(entries: list[dict]) -> None:
+    """Print a summary breakdown of the result set."""
+    if not entries:
+        return
+
+    banner("Statistics")
+
+    by_sev: dict[str, int] = {}
+    by_user: dict[str, int] = {}
+    by_type: dict[str, int] = {}
+
+    for e in entries:
+        s = e.get("severity", "UNKNOWN")
+        u = e.get("user") or "(no user)"
+        t = e.get("type", "UNKNOWN")
+        by_sev[s]   = by_sev.get(s, 0) + 1
+        by_user[u]  = by_user.get(u, 0) + 1
+        by_type[t]  = by_type.get(t, 0) + 1
+
+    info(clr("Severity breakdown:", BOLD))
+    for sev, count in sorted(by_sev.items()):
+        bar = "█" * min(count, 40)
+        print(f"    {fmt_severity(sev)} {clr(bar, CYAN)} {clr(str(count), BOLD)}")
+
+    info("")
+    info(clr("Top users (by event count):", BOLD))
+    for user, count in sorted(by_user.items(), key=lambda x: -x[1])[:10]:
+        print(f"    {clr(user.ljust(24), BLUE)}  {clr(str(count), BOLD)}")
+
+    info("")
+    info(clr("Event types:", BOLD))
+    for t, count in sorted(by_type.items(), key=lambda x: -x[1]):
+        print(f"    {clr(t.ljust(20), GRAY)}  {count}")
+
+
+def save_csv(entries: list[dict], path: str) -> None:
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=FIELDS)
+        writer.writeheader()
+        writer.writerows(entries)
+    ok(f"Saved {len(entries)} entries → {path}")
+
+
+def save_json(entries: list[dict], path: str) -> None:
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(entries, f, indent=2)
+    ok(f"Saved {len(entries)} entries → {path}")
+
+
+# ── CLI argument parser ───────────────────────────────────────────────────────
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="sc_login_logs.py",
+        description="Tenable Security Center — system/log client with pagination",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+FILTER NOTES
+  --date-from / --date-to accept YYYYMM format.
+  If only --date-from is given, that single month is queried.
+  Pass 'all' to either to fetch across all time (default).
+
+  --severity overrides the default INFO+WARNING filter.
+  --module   overrides the default 'auth' module filter.
+  Multiple --filter KEY=VALUE pairs are ANDed together.
+
+EXAMPLES
+  # All auth events, default limit
+  python sc_login_logs.py --host sc.corp --access-key A --secret-key B
+
+  # Failed logins in May 2025, export CSV
+  python sc_login_logs.py --host sc.corp --access-key A --secret-key B \\
+      --date-from 202505 --date-to 202505 --severity WARNING --output failed.csv
+
+  # 1000 events with custom page size
+  python sc_login_logs.py --host sc.corp --access-key A --secret-key B \\
+      --limit 1000 --page-size 200
+
+  # Override module to admin, keyword filter
+  python sc_login_logs.py --host sc.corp --access-key A --secret-key B \\
+      --module admin --keyword jdoe
+
+  # Environment variables instead of flags
+  export SC_HOST=sc.corp SC_ACCESS_KEY=abc SC_SECRET_KEY=xyz
+  python sc_login_logs.py --limit 50
+        """,
+    )
+
+    # ── Connection
+    conn = p.add_argument_group("Connection")
+    conn.add_argument("--host",       default=os.getenv("SC_HOST"),
+                      help="SC hostname or IP  [env: SC_HOST]")
+    conn.add_argument("--access-key", default=os.getenv("SC_ACCESS_KEY"),
+                      help="SC API access key  [env: SC_ACCESS_KEY]")
+    conn.add_argument("--secret-key", default=os.getenv("SC_SECRET_KEY"),
+                      help="SC API secret key  [env: SC_SECRET_KEY]")
+    conn.add_argument("--verify-ssl", action="store_true", default=False,
+                      help="Verify SSL certificate (default: False for self-signed)")
+
+    # ── Date range
+    dates = p.add_argument_group("Date range")
+    dates.add_argument("--date-from", default="all", metavar="YYYYMM",
+                       help="Start month in YYYYMM format, or 'all' (default: all)")
+    dates.add_argument("--date-to",   default=None,  metavar="YYYYMM",
+                       help="End month in YYYYMM format (optional, defaults to --date-from)")
+
+    # ── Volume
+    vol = p.add_argument_group("Volume / pagination")
+    vol.add_argument("--limit",     type=int, default=100, metavar="N",
+                     help="Max total log entries to retrieve, 0=unlimited (default: 100)")
+    vol.add_argument("--page-size", type=int, default=100, metavar="N",
+                     help="Entries per API page/request (default: 100, max recommended: 500)")
+
+    # ── Filters (overridable)
+    filt = p.add_argument_group("Filters (all are AND-ed together)")
+    filt.add_argument("--module",   default="auth",
+                      help="Log module to query (default: auth). Options: auth, apikey, admin, etc.")
+    filt.add_argument("--severity", default=None,
+                      choices=["INFO", "WARNING", "CRITICAL"],
+                      help="Severity filter override (default: all severities)")
+    filt.add_argument("--keyword",  default=None,
+                      help="Free-text keyword filter (e.g. a username or IP address)")
+    filt.add_argument("--filter",   action="append", metavar="KEY=VALUE",
+                      dest="extra_filters",
+                      help="Additional raw SC filters as KEY=VALUE pairs. Repeatable.")
+
+    # ── Output
+    out = p.add_argument_group("Output")
+    out.add_argument("--output", default=None, metavar="FILE",
+                     help="Save results to FILE (.csv or .json). Extension determines format.")
+    out.add_argument("--display-limit", type=int, default=50, metavar="N",
+                     help="Max rows shown in terminal table, 0=all (default: 50)")
+    out.add_argument("--no-stats", action="store_true",
+                     help="Skip the statistics summary at the end")
+    out.add_argument("--quiet", action="store_true",
+                     help="Suppress progress output, only print final count")
+
+    # ── Misc
+    p.add_argument("--list-modules", action="store_true",
+                   help="List available log modules then exit")
+
+    return p
+
+
+# ── Filter builder ────────────────────────────────────────────────────────────
+def build_filters(args: argparse.Namespace) -> list[dict]:
+    """Construct the SC filter list from CLI arguments."""
+    filters: list[dict] = []
+
+    # Module filter (always present)
+    filters.append({
+        "filterName": "module",
+        "operator":   "=",
+        "value":      args.module,
+    })
+
+    # Severity override
+    if args.severity:
+        sev_id = {"INFO": 0, "WARNING": 2, "CRITICAL": 3}.get(args.severity, 0)
+        filters.append({
+            "filterName": "severity",
+            "operator":   "=",
+            "value":      {"id": sev_id, "name": args.severity},
+        })
+
+    # Keyword filter
+    if args.keyword:
+        filters.append({
+            "filterName": "keywords",
+            "operator":   "=",
+            "value":      args.keyword,
+        })
+
+    # Extra --filter KEY=VALUE overrides
+    if args.extra_filters:
+        for kv in args.extra_filters:
+            if "=" not in kv:
+                warn(f"Ignoring malformed --filter '{kv}' (expected KEY=VALUE)")
+                continue
+            key, _, value = kv.partition("=")
+            filters.append({
+                "filterName": key.strip(),
+                "operator":   "=",
+                "value":      value.strip(),
+            })
+
+    return filters
+
+
+# ── Date resolver ─────────────────────────────────────────────────────────────
+def resolve_date(date_from: str, date_to: Optional[str]) -> str:
+    """
+    SC's system/log 'date' field accepts 'all' or a single 'YYYYMM' month.
+    If a range is given we iterate month-by-month and merge results in the
+    caller; here we just return the single value for a single-page call.
+    """
+    if date_from.lower() == "all":
+        return "all"
+    return date_from
+
+
+def month_range(date_from: str, date_to: str) -> list[str]:
+    """Generate list of YYYYMM strings between two months (inclusive)."""
+    if date_from.lower() == "all" or date_to is None:
+        return [date_from]
+    try:
+        start = datetime.strptime(date_from, "%Y%m")
+        end   = datetime.strptime(date_to,   "%Y%m")
+    except ValueError as e:
+        sys.exit(f"Invalid date format: {e}  (expected YYYYMM)")
+
+    months = []
+    cur = start
+    while cur <= end:
+        months.append(cur.strftime("%Y%m"))
+        # Advance one month
+        if cur.month == 12:
+            cur = cur.replace(year=cur.year + 1, month=1)
+        else:
+            cur = cur.replace(month=cur.month + 1)
+    return months
+
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+def main() -> None:
+    parser  = build_parser()
+    args    = parser.parse_args()
+
+    # ── Validate required connection args
+    missing = [n for n, v in [("--host", args.host),
+                               ("--access-key", args.access_key),
+                               ("--secret-key", args.secret_key)] if not v]
+    if missing:
+        parser.error(
+            f"Missing required argument(s): {', '.join(missing)}\n"
+            "Set them via CLI flags or environment variables "
+            "(SC_HOST, SC_ACCESS_KEY, SC_SECRET_KEY)"
+        )
+
+    # ── Splash
+    if not args.quiet:
+        print(f"\n{clr('╔══════════════════════════════════════════════════╗', BOLD + CYAN)}")
+        print(f"{clr('║   Tenable SC — system/log Python Client          ║', BOLD + CYAN)}")
+        print(f"{clr('╚══════════════════════════════════════════════════╝', BOLD + CYAN)}\n")
+        info(f"Host:      {clr(args.host, CYAN)}")
+        info(f"Module:    {clr(args.module, CYAN)}")
+        info(f"Date from: {clr(args.date_from, CYAN)}")
+        info(f"Date to:   {clr(args.date_to or args.date_from, CYAN)}")
+        info(f"Limit:     {clr(str(args.limit) + (' (unlimited)' if args.limit == 0 else ''), CYAN)}")
+        info(f"Page size: {clr(str(args.page_size), CYAN)}")
+        info(f"Severity:  {clr(args.severity or 'all', CYAN)}")
+        if args.keyword:
+            info(f"Keyword:   {clr(args.keyword, CYAN)}")
+
+    # ── Connect
+    client = SecurityCenterClient(
+        host=args.host,
+        access_key=args.access_key,
+        secret_key=args.secret_key,
+        verify_ssl=args.verify_ssl,
+    )
+
+    # ── Optional: list modules and exit
+    if args.list_modules:
+        banner("Available Log Modules")
+        try:
+            modules = client.list_modules()
+            for m in modules:
+                name = m.get("name", m) if isinstance(m, dict) else m
+                info(f"  {clr(name, CYAN)}")
+        except Exception as e:
+            err(f"Failed to list modules: {e}")
+            sys.exit(1)
+        return
+
+    # ── Connectivity check
+    if not args.quiet:
+        banner("Connectivity Check")
+    try:
+        ping = client.ping()
+        sc_info = ping.get("response", {})
+        if not args.quiet:
+            ok(f"Connected to SC  version={sc_info.get('version', '?')}  "
+               f"build={sc_info.get('buildID', '?')}")
+    except Exception as e:
+        err(f"Cannot reach SC at {args.host}: {e}")
+        sys.exit(1)
+
+    # ── Build filters
+    filters = build_filters(args)
+    if not args.quiet:
+        banner("Active Filters")
+        for f in filters:
+            info(f"  {clr(f['filterName'], BLUE)} = {clr(str(f['value']), YELLOW)}")
+
+    # ── Determine date months to iterate
+    date_to    = args.date_to or (args.date_from if args.date_from != "all" else None)
+    months     = month_range(args.date_from, date_to)
+    all_entries: list[dict] = []
+
+    # ── Fetch — iterate over months if a range is given
+    for month in months:
+        if len(months) > 1 and not args.quiet:
+            banner(f"Fetching month: {month}")
+
+        # How many more do we still need?
+        remaining = (args.limit - len(all_entries)) if args.limit > 0 else 0
+
+        entries = fetch_all_pages(
+            client     = client,
+            date_value = month,
+            filters    = filters,
+            limit      = remaining,
+            page_size  = args.page_size,
+        )
+        all_entries.extend(entries)
+
+        if args.limit > 0 and len(all_entries) >= args.limit:
+            all_entries = all_entries[:args.limit]
+            break
+
+    # ── Results
+    banner("Results")
+    ok(f"Total entries retrieved: {clr(str(len(all_entries)), BOLD)}")
+
+    if not all_entries:
+        warn("No log entries matched the given filters.")
+        sys.exit(0)
+
+    # Terminal table
+    print_table(all_entries, max_rows=args.display_limit)
+
+    # Stats
+    if not args.no_stats:
+        print_stats(all_entries)
+
+    # File output
+    if args.output:
+        banner("Saving Output")
+        ext = os.path.splitext(args.output)[1].lower()
+        if ext == ".json":
+            save_json(all_entries, args.output)
+        elif ext == ".csv":
+            save_csv(all_entries, args.output)
+        else:
+            # Default to CSV for unknown extensions
+            save_csv(all_entries, args.output)
+
+    print()
+
+
+if __name__ == "__main__":
+    main()
