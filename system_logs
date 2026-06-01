@@ -3,6 +3,8 @@
 Tenable Security Center — system/log Python Client
 ====================================================
 Fetches login/auth events from the SC REST API with support for:
+  - API key authentication (--access-key / --secret-key)
+  - Username / password authentication (--username / --password)
   - Date range filtering (--date-from / --date-to)
   - Limit on total logs retrieved (--limit)
   - Severity filter override (--severity)
@@ -15,14 +17,17 @@ Requirements:
     pip install requests urllib3
 
 Usage examples:
-    # All auth events, last 100 entries
+    # API key auth — all auth events, last 100 entries
     python sc_login_logs.py --host 192.168.1.100 --access-key ABC --secret-key XYZ
 
-    # Failed logins only, specific month
-    python sc_login_logs.py --host sc.internal --access-key ABC --secret-key XYZ \\
+    # Username / password auth
+    python sc_login_logs.py --host sc.internal --username admin --password s3cr3t
+
+    # Failed logins only, specific month (username/password)
+    python sc_login_logs.py --host sc.internal --username admin --password s3cr3t \\
         --date-from 202505 --date-to 202505 --severity WARNING --limit 500
 
-    # Search for a specific user, export to CSV
+    # Search for a specific user, export to CSV (API key)
     python sc_login_logs.py --host sc.internal --access-key ABC --secret-key XYZ \\
         --keyword jdoe --output logs.csv
 
@@ -31,7 +36,7 @@ Usage examples:
         --module admin --limit 1000 --page-size 200
 
     # Use environment variables instead of CLI flags
-    export SC_HOST=sc.internal SC_ACCESS_KEY=abc SC_SECRET_KEY=xyz
+    export SC_HOST=sc.internal SC_USERNAME=admin SC_PASSWORD=s3cr3t
     python sc_login_logs.py --limit 50 --output events.json
 """
 
@@ -53,7 +58,7 @@ except ImportError:
 # Suppress SSL warnings for self-signed certs (common in SC on-prem installs)
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-# ── ANSI colours ──────────────────────────────────────────────────────────────
+# ── ANSI colours ──────────────────────────────────────────────────────────────────────────────
 RESET  = "\x1b[0m"
 BOLD   = "\x1b[1m"
 DIM    = "\x1b[2m"
@@ -82,7 +87,7 @@ def info(msg: str) -> None: print(clr(f"   {msg}", WHITE))
 def dim(msg: str)  -> None: print(clr(f"   {msg}", DIM + GRAY))
 
 
-# ── Severity colour map ───────────────────────────────────────────────────────
+# ── Severity colour map ─────────────────────────────────────────────────────────────────────────────
 SEV_COLOUR = {
     "INFO":     GREEN,
     "WARNING":  YELLOW,
@@ -93,7 +98,7 @@ def fmt_severity(sev: str) -> str:
     return clr(sev.ljust(10), SEV_COLOUR.get(sev.upper(), WHITE))
 
 
-# ── CSV log parser ────────────────────────────────────────────────────────────
+# ── CSV log parser ──────────────────────────────────────────────────────────────────────────────
 # SC returns system/log as raw CSV lines:
 #   "timestamp","user","module","severity","type","message"
 FIELDS = ["timestamp", "user", "module", "severity", "type", "message"]
@@ -111,19 +116,71 @@ def parse_csv_response(raw: str) -> list[dict]:
     return entries
 
 
-# ── SC API client ─────────────────────────────────────────────────────────────
+# ── SC API client ──────────────────────────────────────────────────────────────────────────────
 class SecurityCenterClient:
-    """Minimal Tenable Security Center REST API client."""
+    """
+    Minimal Tenable Security Center REST API client.
 
-    def __init__(self, host: str, access_key: str, secret_key: str, verify_ssl: bool = False):
-        self.base_url = f"https://{host}/rest"
-        self.session  = requests.Session()
+    Supports two mutually exclusive authentication methods:
+      - API key:           pass access_key + secret_key
+      - Username/password: pass username + password (acquires a session token
+                           via POST /token and releases it with DELETE /token
+                           on logout)
+    """
+
+    def __init__(
+        self,
+        host: str,
+        verify_ssl: bool = False,
+        access_key: Optional[str] = None,
+        secret_key: Optional[str] = None,
+        username: Optional[str] = None,
+        password: Optional[str] = None,
+    ):
+        self.base_url     = f"https://{host}/rest"
+        self._session_auth = bool(username and password)
+        self.session      = requests.Session()
         self.session.verify = verify_ssl
         self.session.headers.update({
-            "x-apikey":    f"accesskey={access_key}; secretkey={secret_key}",
-            "Accept":      "application/json",
+            "Accept":       "application/json",
             "Content-Type": "application/json",
         })
+
+        if self._session_auth:
+            self._login(username, password)
+        else:
+            self.session.headers["x-apikey"] = (
+                f"accesskey={access_key}; secretkey={secret_key}"
+            )
+
+    def _login(self, username: str, password: str) -> None:
+        """POST /token to obtain a session token (username/password auth)."""
+        url = f"{self.base_url}/token"
+        dim(f"→ POST {url}  (session login)")
+        resp = self.session.post(
+            url,
+            json={"username": username, "password": password},
+            timeout=30,
+        )
+        dim(f"← HTTP {resp.status_code}  ({len(resp.content)} bytes)")
+        resp.raise_for_status()
+        token = resp.json().get("response", {}).get("token")
+        if not token:
+            sys.exit("[ERROR] Login failed: server did not return a session token.")
+        self.session.headers["X-SecurityCenter-Token"] = str(token)
+        ok("Session token obtained")
+
+    def logout(self) -> None:
+        """DELETE /token to invalidate the session (username/password auth only)."""
+        if not self._session_auth:
+            return
+        try:
+            url = f"{self.base_url}/token"
+            dim(f"→ DELETE {url}  (session logout)")
+            self.session.delete(url, timeout=10)
+            ok("Session logged out")
+        except Exception as exc:
+            warn(f"Logout request failed (session may have already expired): {exc}")
 
     def get(self, path: str) -> dict:
         url = f"{self.base_url}{path}"
@@ -150,7 +207,7 @@ class SecurityCenterClient:
         return data.get("response", [])
 
 
-# ── Paginator ─────────────────────────────────────────────────────────────────
+# ── Paginator ─────────────────────────────────────────────────────────────────────────────────
 def fetch_all_pages(
     client: SecurityCenterClient,
     date_value: str,
@@ -161,23 +218,12 @@ def fetch_all_pages(
     """
     Paginate through /system/log until we have `limit` entries or the
     server returns fewer rows than page_size (indicating last page).
-
-    Args:
-        client:     Authenticated SC client
-        date_value: 'all' or 'YYYYMM'
-        filters:    List of SC filter dicts
-        limit:      Maximum total entries to retrieve (0 = unlimited)
-        page_size:  Rows per page (endOffset - startOffset)
-
-    Returns:
-        Flat list of parsed log entry dicts
     """
     all_entries: list[dict] = []
     offset = 0
     page   = 1
 
     while True:
-        # If a limit is set, don't request more than what's left
         remaining  = (limit - len(all_entries)) if limit > 0 else page_size
         batch_size = min(page_size, remaining) if limit > 0 else page_size
 
@@ -200,7 +246,6 @@ def fetch_all_pages(
             err(f"Response body: {e.response.text[:400]}")
             break
 
-        # SC returns CSV; detect if somehow JSON was returned (error payloads)
         content_type = resp.headers.get("content-type", "")
         if "application/json" in content_type:
             body = resp.json()
@@ -212,7 +257,6 @@ def fetch_all_pages(
 
         all_entries.extend(entries)
 
-        # Stop conditions
         if len(entries) < batch_size:
             ok("Last page reached (server returned fewer rows than requested)")
             break
@@ -227,7 +271,7 @@ def fetch_all_pages(
     return all_entries
 
 
-# ── Output formatters ─────────────────────────────────────────────────────────
+# ── Output formatters ─────────────────────────────────────────────────────────────────────────────
 def print_table(entries: list[dict], max_rows: int = 0) -> None:
     """Render entries as a terminal table."""
     if not entries:
@@ -312,13 +356,22 @@ def save_json(entries: list[dict], path: str) -> None:
     ok(f"Saved {len(entries)} entries → {path}")
 
 
-# ── CLI argument parser ───────────────────────────────────────────────────────
+# ── CLI argument parser ─────────────────────────────────────────────────────────────────────────────
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="sc_login_logs.py",
         description="Tenable Security Center — system/log client with pagination",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
+AUTHENTICATION
+  Use one of:
+    API key:           --access-key KEY --secret-key KEY
+    Username/password: --username USER --password PASS
+
+  Environment variables:
+    SC_ACCESS_KEY + SC_SECRET_KEY   (API key)
+    SC_USERNAME   + SC_PASSWORD     (username/password)
+
 FILTER NOTES
   --date-from / --date-to accept YYYYMM format.
   If only --date-from is given, that single month is queried.
@@ -329,23 +382,22 @@ FILTER NOTES
   Multiple --filter KEY=VALUE pairs are ANDed together.
 
 EXAMPLES
-  # All auth events, default limit
+  # API key auth
   python sc_login_logs.py --host sc.corp --access-key A --secret-key B
 
+  # Username / password auth
+  python sc_login_logs.py --host sc.corp --username admin --password s3cr3t
+
   # Failed logins in May 2025, export CSV
-  python sc_login_logs.py --host sc.corp --access-key A --secret-key B \\
+  python sc_login_logs.py --host sc.corp --username admin --password s3cr3t \\
       --date-from 202505 --date-to 202505 --severity WARNING --output failed.csv
 
   # 1000 events with custom page size
   python sc_login_logs.py --host sc.corp --access-key A --secret-key B \\
       --limit 1000 --page-size 200
 
-  # Override module to admin, keyword filter
-  python sc_login_logs.py --host sc.corp --access-key A --secret-key B \\
-      --module admin --keyword jdoe
-
-  # Environment variables instead of flags
-  export SC_HOST=sc.corp SC_ACCESS_KEY=abc SC_SECRET_KEY=xyz
+  # Environment variables
+  export SC_HOST=sc.corp SC_USERNAME=admin SC_PASSWORD=s3cr3t
   python sc_login_logs.py --limit 50
         """,
     )
@@ -354,12 +406,25 @@ EXAMPLES
     conn = p.add_argument_group("Connection")
     conn.add_argument("--host",       default=os.getenv("SC_HOST"),
                       help="SC hostname or IP  [env: SC_HOST]")
-    conn.add_argument("--access-key", default=os.getenv("SC_ACCESS_KEY"),
-                      help="SC API access key  [env: SC_ACCESS_KEY]")
-    conn.add_argument("--secret-key", default=os.getenv("SC_SECRET_KEY"),
-                      help="SC API secret key  [env: SC_SECRET_KEY]")
     conn.add_argument("--verify-ssl", action="store_true", default=False,
                       help="Verify SSL certificate (default: False for self-signed)")
+
+    # ── Authentication (mutually exclusive methods)
+    auth = p.add_argument_group(
+        "Authentication (use API key OR username/password, not both)"
+    )
+    auth.add_argument("--access-key", default=os.getenv("SC_ACCESS_KEY"),
+                      metavar="KEY",
+                      help="SC API access key  [env: SC_ACCESS_KEY]")
+    auth.add_argument("--secret-key", default=os.getenv("SC_SECRET_KEY"),
+                      metavar="KEY",
+                      help="SC API secret key  [env: SC_SECRET_KEY]")
+    auth.add_argument("--username",   default=os.getenv("SC_USERNAME"),
+                      metavar="USER",
+                      help="SC username  [env: SC_USERNAME]")
+    auth.add_argument("--password",   default=os.getenv("SC_PASSWORD"),
+                      metavar="PASS",
+                      help="SC password  [env: SC_PASSWORD]")
 
     # ── Date range
     dates = p.add_argument_group("Date range")
@@ -375,7 +440,7 @@ EXAMPLES
     vol.add_argument("--page-size", type=int, default=100, metavar="N",
                      help="Entries per API page/request (default: 100, max recommended: 500)")
 
-    # ── Filters (overridable)
+    # ── Filters
     filt = p.add_argument_group("Filters (all are AND-ed together)")
     filt.add_argument("--module",   default="auth",
                       help="Log module to query (default: auth). Options: auth, apikey, admin, etc.")
@@ -406,19 +471,17 @@ EXAMPLES
     return p
 
 
-# ── Filter builder ────────────────────────────────────────────────────────────
+# ── Filter builder ──────────────────────────────────────────────────────────────────────────────
 def build_filters(args: argparse.Namespace) -> list[dict]:
     """Construct the SC filter list from CLI arguments."""
     filters: list[dict] = []
 
-    # Module filter (always present)
     filters.append({
         "filterName": "module",
         "operator":   "=",
         "value":      args.module,
     })
 
-    # Severity override
     if args.severity:
         sev_id = {"INFO": 0, "WARNING": 2, "CRITICAL": 3}.get(args.severity, 0)
         filters.append({
@@ -427,7 +490,6 @@ def build_filters(args: argparse.Namespace) -> list[dict]:
             "value":      {"id": sev_id, "name": args.severity},
         })
 
-    # Keyword filter
     if args.keyword:
         filters.append({
             "filterName": "keywords",
@@ -435,7 +497,6 @@ def build_filters(args: argparse.Namespace) -> list[dict]:
             "value":      args.keyword,
         })
 
-    # Extra --filter KEY=VALUE overrides
     if args.extra_filters:
         for kv in args.extra_filters:
             if "=" not in kv:
@@ -451,19 +512,8 @@ def build_filters(args: argparse.Namespace) -> list[dict]:
     return filters
 
 
-# ── Date resolver ─────────────────────────────────────────────────────────────
-def resolve_date(date_from: str, date_to: Optional[str]) -> str:
-    """
-    SC's system/log 'date' field accepts 'all' or a single 'YYYYMM' month.
-    If a range is given we iterate month-by-month and merge results in the
-    caller; here we just return the single value for a single-page call.
-    """
-    if date_from.lower() == "all":
-        return "all"
-    return date_from
-
-
-def month_range(date_from: str, date_to: str) -> list[str]:
+# ── Date helpers ───────────────────────────────────────────────────────────────────────────────
+def month_range(date_from: str, date_to: Optional[str]) -> list[str]:
     """Generate list of YYYYMM strings between two months (inclusive)."""
     if date_from.lower() == "all" or date_to is None:
         return [date_from]
@@ -477,7 +527,6 @@ def month_range(date_from: str, date_to: str) -> list[str]:
     cur = start
     while cur <= end:
         months.append(cur.strftime("%Y%m"))
-        # Advance one month
         if cur.month == 12:
             cur = cur.replace(year=cur.year + 1, month=1)
         else:
@@ -485,20 +534,35 @@ def month_range(date_from: str, date_to: str) -> list[str]:
     return months
 
 
-# ── Main ──────────────────────────────────────────────────────────────────────
+# ── Main ───────────────────────────────────────────────────────────────────────────────────────
 def main() -> None:
-    parser  = build_parser()
-    args    = parser.parse_args()
+    parser = build_parser()
+    args   = parser.parse_args()
 
-    # ── Validate required connection args
-    missing = [n for n, v in [("--host", args.host),
-                               ("--access-key", args.access_key),
-                               ("--secret-key", args.secret_key)] if not v]
-    if missing:
+    # ── Validate host
+    if not args.host:
         parser.error(
-            f"Missing required argument(s): {', '.join(missing)}\n"
-            "Set them via CLI flags or environment variables "
-            "(SC_HOST, SC_ACCESS_KEY, SC_SECRET_KEY)"
+            "Missing required argument: --host\n"
+            "Set it via --host or the SC_HOST environment variable."
+        )
+
+    # ── Validate authentication
+    has_apikey   = bool(args.access_key and args.secret_key)
+    has_userpass = bool(args.username and args.password)
+
+    if has_apikey and has_userpass:
+        parser.error(
+            "Specify either API key (--access-key / --secret-key) "
+            "or username/password (--username / --password), not both."
+        )
+
+    if not has_apikey and not has_userpass:
+        parser.error(
+            "Authentication required. Use one of:\n"
+            "  API key:           --access-key KEY --secret-key KEY\n"
+            "  Username/password: --username USER --password PASS\n"
+            "Or set environment variables: SC_ACCESS_KEY + SC_SECRET_KEY  "
+            "or  SC_USERNAME + SC_PASSWORD"
         )
 
     # ── Splash
@@ -507,6 +571,10 @@ def main() -> None:
         print(f"{clr('║   Tenable SC — system/log Python Client          ║', BOLD + CYAN)}")
         print(f"{clr('╚══════════════════════════════════════════════════╝', BOLD + CYAN)}\n")
         info(f"Host:      {clr(args.host, CYAN)}")
+        auth_method = "username/password" if has_userpass else "API key"
+        info(f"Auth:      {clr(auth_method, CYAN)}")
+        if has_userpass:
+            info(f"User:      {clr(args.username, CYAN)}")
         info(f"Module:    {clr(args.module, CYAN)}")
         info(f"Date from: {clr(args.date_from, CYAN)}")
         info(f"Date to:   {clr(args.date_to or args.date_from, CYAN)}")
@@ -518,10 +586,12 @@ def main() -> None:
 
     # ── Connect
     client = SecurityCenterClient(
-        host=args.host,
-        access_key=args.access_key,
-        secret_key=args.secret_key,
-        verify_ssl=args.verify_ssl,
+        host       = args.host,
+        verify_ssl = args.verify_ssl,
+        access_key = args.access_key,
+        secret_key = args.secret_key,
+        username   = args.username,
+        password   = args.password,
     )
 
     # ── Optional: list modules and exit
@@ -534,20 +604,23 @@ def main() -> None:
                 info(f"  {clr(name, CYAN)}")
         except Exception as e:
             err(f"Failed to list modules: {e}")
+            client.logout()
             sys.exit(1)
+        client.logout()
         return
 
     # ── Connectivity check
     if not args.quiet:
         banner("Connectivity Check")
     try:
-        ping = client.ping()
+        ping    = client.ping()
         sc_info = ping.get("response", {})
         if not args.quiet:
             ok(f"Connected to SC  version={sc_info.get('version', '?')}  "
                f"build={sc_info.get('buildID', '?')}")
     except Exception as e:
         err(f"Cannot reach SC at {args.host}: {e}")
+        client.logout()
         sys.exit(1)
 
     # ── Build filters
@@ -558,8 +631,8 @@ def main() -> None:
             info(f"  {clr(f['filterName'], BLUE)} = {clr(str(f['value']), YELLOW)}")
 
     # ── Determine date months to iterate
-    date_to    = args.date_to or (args.date_from if args.date_from != "all" else None)
-    months     = month_range(args.date_from, date_to)
+    date_to      = args.date_to or (args.date_from if args.date_from != "all" else None)
+    months       = month_range(args.date_from, date_to)
     all_entries: list[dict] = []
 
     # ── Fetch — iterate over months if a range is given
@@ -567,7 +640,6 @@ def main() -> None:
         if len(months) > 1 and not args.quiet:
             banner(f"Fetching month: {month}")
 
-        # How many more do we still need?
         remaining = (args.limit - len(all_entries)) if args.limit > 0 else 0
 
         entries = fetch_all_pages(
@@ -589,27 +661,24 @@ def main() -> None:
 
     if not all_entries:
         warn("No log entries matched the given filters.")
+        client.logout()
         sys.exit(0)
 
-    # Terminal table
     print_table(all_entries, max_rows=args.display_limit)
 
-    # Stats
     if not args.no_stats:
         print_stats(all_entries)
 
-    # File output
     if args.output:
         banner("Saving Output")
         ext = os.path.splitext(args.output)[1].lower()
         if ext == ".json":
             save_json(all_entries, args.output)
-        elif ext == ".csv":
-            save_csv(all_entries, args.output)
         else:
-            # Default to CSV for unknown extensions
             save_csv(all_entries, args.output)
 
+    # ── Logout (no-op for API key auth)
+    client.logout()
     print()
 
 
